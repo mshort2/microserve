@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "microserve"
+version = "0.0.1"
+description = "Minimal LLM inference engine with paged KV cache and custom CUDA attention kernel"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4",
+    "transformers>=4.45",
+    "safetensors>=0.4",
+    "huggingface-hub>=0.24",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+bench = ["matplotlib", "pandas"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["microserve*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
