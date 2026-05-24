@@ -97,6 +97,14 @@ def apply_rope(
     return q_out, k_out
 
 
+def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """[B, n_kv, T, D] -> [B, n_kv * n_rep, T, D]. Matches HF's path so sdpa picks the same backend."""
+    if n_rep == 1:
+        return x
+    B, H, T, D = x.shape
+    return x[:, :, None, :, :].expand(B, H, n_rep, T, D).reshape(B, H * n_rep, T, D)
+
+
 class Attention(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -120,7 +128,10 @@ class Attention(nn.Module):
 
         q, k = apply_rope(q, k, cos, sin)
 
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+        n_rep = cfg.num_q_heads // cfg.num_kv_heads
+        k = _repeat_kv(k, n_rep)
+        v = _repeat_kv(v, n_rep)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.o_proj(out)
 
