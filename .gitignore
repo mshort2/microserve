@@ -1,0 +1,74 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Compiled CUDA / C++ extension artifacts
+*.so
+*.dylib
+*.o
+*.obj
+*.cubin
+*.fatbin
+*.ptx
+
+# torch.utils.cpp_extension JIT cache
+.torch_extensions/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# Type checkers / linters
+.mypy_cache/
+.ruff_cache/
+.pyright/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Editor / OS
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Model weights / HF downloads (do not commit)
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+weights/
+checkpoints/
+hf_cache/
+
+# Benchmark raw outputs (commit charts + screenshots, not raw traces)
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+*.sqlite
+
+# Logs
+*.log
+logs/
+
+# Local secrets / env
+.env
+.env.local
+
+# Local planning notes
+PLAN.md
