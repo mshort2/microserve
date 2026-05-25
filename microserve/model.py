@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from microserve.config import ModelConfig
+
+if TYPE_CHECKING:
+    from microserve.kv_cache import FlatKVCache
 
 
 def _rename_hf_key(hf_key: str) -> str | None:
@@ -106,9 +110,10 @@ def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, layer_idx: int):
         super().__init__()
         self.cfg = cfg
+        self.layer_idx = layer_idx
         q_dim = cfg.num_q_heads * cfg.head_dim
         kv_dim = cfg.num_kv_heads * cfg.head_dim
         self.q_proj = nn.Linear(cfg.hidden_size, q_dim, bias=cfg.attention_bias)
@@ -117,7 +122,12 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(q_dim, cfg.hidden_size, bias=False)
 
     def forward(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cache: "FlatKVCache | None" = None,
+        cache_start: int = 0,
     ) -> torch.Tensor:
         B, T, _ = x.shape
         cfg = self.cfg
@@ -129,9 +139,23 @@ class Attention(nn.Module):
         q, k = apply_rope(q, k, cos, sin)
 
         n_rep = cfg.num_q_heads // cfg.num_kv_heads
-        k = _repeat_kv(k, n_rep)
-        v = _repeat_kv(v, n_rep)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+        if cache is None:
+            k_full = _repeat_kv(k, n_rep)
+            v_full = _repeat_kv(v, n_rep)
+            out = F.scaled_dot_product_attention(q, k_full, v_full, is_causal=True)
+        else:
+            # Store post-RoPE K/V so subsequent decode steps don't re-rotate.
+            cache.write(self.layer_idx, cache_start, k, v)
+            k_full, v_full = cache.read(self.layer_idx, cache_start + T)
+            k_full = _repeat_kv(k_full, n_rep)
+            v_full = _repeat_kv(v_full, n_rep)
+            # Prefill (T>1) needs the causal mask; decode (T=1) attends over all
+            # cached past with no future to mask.
+            out = F.scaled_dot_product_attention(
+                q, k_full, v_full, is_causal=(T > 1)
+            )
+
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.o_proj(out)
 
@@ -148,17 +172,24 @@ class MLP(nn.Module):
 
 
 class QwenDecoderLayer(nn.Module):
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, layer_idx: int):
         super().__init__()
         self.input_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
-        self.attn = Attention(cfg)
+        self.attn = Attention(cfg, layer_idx)
         self.post_attn_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.mlp = MLP(cfg)
 
     def forward(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cache: "FlatKVCache | None" = None,
+        cache_start: int = 0,
     ) -> torch.Tensor:
-        x = x + self.attn(self.input_norm(x), cos, sin)
+        x = x + self.attn(
+            self.input_norm(x), cos, sin, cache=cache, cache_start=cache_start
+        )
         x = x + self.mlp(self.post_attn_norm(x))
         return x
 
@@ -172,7 +203,7 @@ class QwenForCausalLM(nn.Module):
             cfg.head_dim, cfg.rope_theta, cfg.max_position_embeddings
         )
         self.layers = nn.ModuleList(
-            [QwenDecoderLayer(cfg) for _ in range(cfg.num_layers)]
+            [QwenDecoderLayer(cfg, i) for i in range(cfg.num_layers)]
         )
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
 
@@ -180,16 +211,22 @@ class QwenForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor | None = None,
+        cache: "FlatKVCache | None" = None,
+        cache_start: int = 0,
     ) -> torch.Tensor:
         B, T = input_ids.shape
         if positions is None:
             positions = (
-                torch.arange(T, device=input_ids.device).unsqueeze(0).expand(B, -1)
+                torch.arange(
+                    cache_start, cache_start + T, device=input_ids.device
+                )
+                .unsqueeze(0)
+                .expand(B, -1)
             )
         x = self.embed(input_ids)
         cos, sin = self.rope(positions)
         for layer in self.layers:
-            x = layer(x, cos, sin)
+            x = layer(x, cos, sin, cache=cache, cache_start=cache_start)
         x = self.norm(x)
         return x @ self.embed.weight.T
 

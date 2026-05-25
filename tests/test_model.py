@@ -2,6 +2,8 @@ import pytest
 import torch
 
 from microserve.config import ModelConfig
+from microserve.engine import Engine
+from microserve.kv_cache import FlatKVCache
 from microserve.model import QwenForCausalLM, load_weights
 
 
@@ -174,3 +176,95 @@ def test_hidden_states_match_hf_fp32():
     finally:
         for h in handles:
             h.remove()
+
+
+# ---------------------------------------------------------------------------
+# Phase 1b tests: KV cache + cached greedy decode
+# ---------------------------------------------------------------------------
+
+
+def _greedy_no_cache(model: QwenForCausalLM, input_ids: torch.Tensor, n_new: int) -> torch.Tensor:
+    """Greedy decode via repeated full prefill — no KV cache. Validated against HF in Phase 1a."""
+    output_ids = input_ids
+    for _ in range(n_new):
+        with torch.no_grad():
+            logits = model(output_ids)
+        next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        output_ids = torch.cat([output_ids, next_tok], dim=-1)
+    return output_ids
+
+
+def test_kv_cache_write_read_roundtrip():
+    """Pure unit test: write at two positions, read back, expect equality."""
+    cfg = ModelConfig.qwen2_5_0_5b()
+    cache = FlatKVCache(cfg, max_seq_len=16, dtype=torch.float32, device="cuda")
+
+    k1 = torch.randn(1, cfg.num_kv_heads, 5, cfg.head_dim, device="cuda")
+    v1 = torch.randn(1, cfg.num_kv_heads, 5, cfg.head_dim, device="cuda")
+    cache.write(layer=3, start_pos=0, k=k1, v=v1)
+
+    k2 = torch.randn(1, cfg.num_kv_heads, 1, cfg.head_dim, device="cuda")
+    v2 = torch.randn(1, cfg.num_kv_heads, 1, cfg.head_dim, device="cuda")
+    cache.write(layer=3, start_pos=5, k=k2, v=v2)
+
+    k_read, v_read = cache.read(layer=3, end_pos=6)
+    assert k_read.shape == (1, cfg.num_kv_heads, 6, cfg.head_dim)
+    assert torch.equal(k_read[:, :, :5, :], k1)
+    assert torch.equal(k_read[:, :, 5:6, :], k2)
+    assert torch.equal(v_read[:, :, :5, :], v1)
+    assert torch.equal(v_read[:, :, 5:6, :], v2)
+
+    # Other layers must be untouched (not equal to layer 3's written values)
+    k_other, _ = cache.read(layer=0, end_pos=6)
+    assert not torch.equal(k_other, k_read), "writes leaked across layers"
+
+
+def test_kv_cache_overflow_raises():
+    """Writing past max_seq_len should raise loudly, not silently corrupt."""
+    cfg = ModelConfig.qwen2_5_0_5b()
+    cache = FlatKVCache(cfg, max_seq_len=8, dtype=torch.float32, device="cuda")
+    k = torch.zeros(1, cfg.num_kv_heads, 5, cfg.head_dim, device="cuda")
+    v = torch.zeros(1, cfg.num_kv_heads, 5, cfg.head_dim, device="cuda")
+    with pytest.raises(RuntimeError, match="overflow"):
+        cache.write(layer=0, start_pos=5, k=k, v=v)
+
+
+def test_greedy_cached_matches_no_cache_fp32():
+    """Phase 1b exit gate: cache-based decode == no-cache repeated prefill (in fp32).
+
+    The no-cache path is validated against HF in Phase 1a, so a match here
+    transitively validates the cache. A failure here is necessarily a bug in
+    FlatKVCache or the cache-aware code in Attention.forward — not in the
+    architecture, since the architecture path is unchanged from Phase 1a.
+    """
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = QwenForCausalLM.from_pretrained(MODEL_ID, device="cuda", dtype=torch.float32)
+    engine = Engine(model, tok, max_seq_len=512)
+
+    n_new = 50
+    for prompt in PROMPTS:
+        input_ids = tok(prompt, return_tensors="pt").input_ids.to("cuda")
+        no_cache_out = _greedy_no_cache(model, input_ids, n_new)
+        cached_out = engine.generate_ids(input_ids, max_new_tokens=n_new)
+
+        if torch.equal(no_cache_out, cached_out):
+            continue
+
+        if no_cache_out.shape != cached_out.shape:
+            pytest.fail(
+                f"prompt={prompt!r}\nshape mismatch: "
+                f"no_cache={no_cache_out.shape} cached={cached_out.shape}"
+            )
+        diff_positions = (no_cache_out[0] != cached_out[0]).nonzero(as_tuple=True)[0]
+        first = diff_positions[0].item()
+        pytest.fail(
+            f"prompt={prompt!r}\n"
+            f"cache divergence at position {first} "
+            f"(token index past prompt: {first - input_ids.shape[1]})\n"
+            f"no_cache tokens [{first}:{first+5}] = {no_cache_out[0, first:first+5].tolist()}\n"
+            f"cached   tokens [{first}:{first+5}] = {cached_out[0, first:first+5].tolist()}\n"
+            f"no_cache text: {tok.decode(no_cache_out[0])!r}\n"
+            f"cached   text: {tok.decode(cached_out[0])!r}"
+        )
