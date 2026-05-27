@@ -1,9 +1,12 @@
-"""Phase 1b CLI: greedy text generation against Qwen 2.5 0.5B.
+"""CLI: greedy text generation against Qwen 2.5 0.5B (single or batched).
 
 Examples:
     python examples/generate.py "The capital of France is"
     python examples/generate.py "Tell me about CUDA" --max-tokens 100
     python examples/generate.py "def fib(n):" --dtype fp32
+
+    # Multiple prompts (batched):
+    python examples/generate.py "Hi" "Once upon a time," "def fib(n):"
 """
 
 from __future__ import annotations
@@ -28,7 +31,9 @@ _DTYPE_MAP = {
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("prompt", help="The prompt to complete.")
+    parser.add_argument(
+        "prompts", nargs="+", help="One or more prompts. >1 enables batched path."
+    )
     parser.add_argument(
         "--max-tokens", type=int, default=50, help="Max new tokens to generate."
     )
@@ -42,8 +47,16 @@ def main() -> None:
     model = QwenForCausalLM.from_pretrained(MODEL_ID, dtype=dtype)
     engine = Engine(model, tokenizer)
 
-    completion = engine.generate(args.prompt, max_new_tokens=args.max_tokens)
-    print(f"{args.prompt}{completion}")
+    if len(args.prompts) == 1:
+        completion = engine.generate(args.prompts[0], max_new_tokens=args.max_tokens)
+        print(f"{args.prompts[0]}{completion}")
+    else:
+        completions = engine.generate_batch(
+            args.prompts, max_new_tokens=args.max_tokens
+        )
+        for p, c in zip(args.prompts, completions):
+            print(f"--- prompt: {p!r} ---")
+            print(f"{p}{c}\n")
 
 
 if __name__ == "__main__":

@@ -128,6 +128,7 @@ class Attention(nn.Module):
         sin: torch.Tensor,
         cache: "FlatKVCache | None" = None,
         cache_start: int = 0,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, T, _ = x.shape
         cfg = self.cfg
@@ -141,6 +142,8 @@ class Attention(nn.Module):
         n_rep = cfg.num_q_heads // cfg.num_kv_heads
 
         if cache is None:
+            # No-cache forward: runs the full transformer on the entire input
+            # each call (used as the architecture-correctness reference path).
             k_full = _repeat_kv(k, n_rep)
             v_full = _repeat_kv(v, n_rep)
             out = F.scaled_dot_product_attention(q, k_full, v_full, is_causal=True)
@@ -150,11 +153,20 @@ class Attention(nn.Module):
             k_full, v_full = cache.read(self.layer_idx, cache_start + T)
             k_full = _repeat_kv(k_full, n_rep)
             v_full = _repeat_kv(v_full, n_rep)
-            # Prefill (T>1) needs the causal mask; decode (T=1) attends over all
-            # cached past with no future to mask.
-            out = F.scaled_dot_product_attention(
-                q, k_full, v_full, is_causal=(T > 1)
-            )
+            if attn_mask is not None:
+                # Batched path: caller supplies an explicit additive mask that
+                # combines padding + causal. Skip is_causal so sdpa doesn't
+                # double-apply causality.
+                out = F.scaled_dot_product_attention(
+                    q, k_full, v_full, attn_mask=attn_mask, is_causal=False
+                )
+            else:
+                # Single-sequence cached path: causal mask during prefill
+                # (T>1), no mask during single-token decode (T==1, the query
+                # is the most recent token so all past is causally valid).
+                out = F.scaled_dot_product_attention(
+                    q, k_full, v_full, is_causal=(T > 1)
+                )
 
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.o_proj(out)
@@ -186,9 +198,15 @@ class QwenDecoderLayer(nn.Module):
         sin: torch.Tensor,
         cache: "FlatKVCache | None" = None,
         cache_start: int = 0,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = x + self.attn(
-            self.input_norm(x), cos, sin, cache=cache, cache_start=cache_start
+            self.input_norm(x),
+            cos,
+            sin,
+            cache=cache,
+            cache_start=cache_start,
+            attn_mask=attn_mask,
         )
         x = x + self.mlp(self.post_attn_norm(x))
         return x
@@ -213,6 +231,7 @@ class QwenForCausalLM(nn.Module):
         positions: torch.Tensor | None = None,
         cache: "FlatKVCache | None" = None,
         cache_start: int = 0,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, T = input_ids.shape
         if positions is None:
@@ -226,7 +245,14 @@ class QwenForCausalLM(nn.Module):
         x = self.embed(input_ids)
         cos, sin = self.rope(positions)
         for layer in self.layers:
-            x = layer(x, cos, sin, cache=cache, cache_start=cache_start)
+            x = layer(
+                x,
+                cos,
+                sin,
+                cache=cache,
+                cache_start=cache_start,
+                attn_mask=attn_mask,
+            )
         x = self.norm(x)
         return x @ self.embed.weight.T
 

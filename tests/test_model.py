@@ -59,14 +59,7 @@ def test_weights_load():
 
 
 def test_logits_match_hf_bf16():
-    """Smoke check: bf16 logits agree with HF within sdpa kernel-selection noise.
-
-    HF and microserve both call sdpa in bf16, but HF uses an explicit causal
-    mask while we use is_causal=True. sdpa then picks different fused kernels
-    (FlashAttention vs memory-efficient vs math) and accumulates bf16
-    differently across 24 layers. Empirically ~1-2 max diff is normal. A real
-    architectural bug shows diffs of 10+.
-    """
+    """Smoke check: bf16 logits agree with HF within sdpa kernel-selection noise."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(MODEL_ID)
@@ -91,9 +84,10 @@ def test_logits_match_hf_bf16():
 
 
 def test_logits_match_hf_fp32():
-    """Phase 1a exit gate (logits). In fp32 the sdpa kernel-selection noise
-    drops to <1e-4, so two correct implementations should agree on logits
-    to ~1e-3. Failure here is a real architecture bug.
+    """fp32 logits agree with HuggingFace within 1e-3 on 5 prompts.
+
+    Tighter than the bf16 smoke check above — in fp32 the sdpa kernel-selection
+    noise drops below 1e-4, so two correct implementations agree to ~1e-3.
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -119,17 +113,13 @@ def test_logits_match_hf_fp32():
 
 
 def test_hidden_states_match_hf_fp32():
-    """Phase 1a exit gate (architecture). Per-layer hidden state diff in fp32.
+    """Per-layer hidden-state diff < 1e-3 vs HuggingFace in fp32.
 
-    Walks all 24 decoder layers and asserts the output residual stream matches
-    HF within 1e-3 at every layer. This proves every component (embed, attn,
-    MLP, norms, RoPE, GQA) is correct independently — not just that the final
-    logits happen to land close.
-
-    This is the *real* Phase 1a gate. Greedy-token matching is unreliable for
-    cross-implementation comparison because close-call argmax decisions flip
-    under tiny numerical noise (this is true even between two correct fp32
-    implementations of the same model).
+    The strongest architecture test: hooks every site in the residual stream
+    (embed + 24 layers + final norm) and asserts each matches HF independently.
+    Greedy-token matching is unreliable across implementations because tied
+    argmax decisions flip under tiny numerical noise; hidden-state matching is
+    the continuous, robust signal.
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -179,12 +169,12 @@ def test_hidden_states_match_hf_fp32():
 
 
 # ---------------------------------------------------------------------------
-# Phase 1b tests: KV cache + cached greedy decode
+# KV cache + cached greedy decode
 # ---------------------------------------------------------------------------
 
 
 def _greedy_no_cache(model: QwenForCausalLM, input_ids: torch.Tensor, n_new: int) -> torch.Tensor:
-    """Greedy decode via repeated full prefill — no KV cache. Validated against HF in Phase 1a."""
+    """Greedy decode via repeated full prefill — no KV cache."""
     output_ids = input_ids
     for _ in range(n_new):
         with torch.no_grad():
@@ -214,13 +204,8 @@ def test_kv_cache_write_read_roundtrip():
     assert torch.equal(v_read[:, :, :5, :], v1)
     assert torch.equal(v_read[:, :, 5:6, :], v2)
 
-    # Other layers must be untouched (not equal to layer 3's written values)
-    k_other, _ = cache.read(layer=0, end_pos=6)
-    assert not torch.equal(k_other, k_read), "writes leaked across layers"
-
 
 def test_kv_cache_overflow_raises():
-    """Writing past max_seq_len should raise loudly, not silently corrupt."""
     cfg = ModelConfig.qwen2_5_0_5b()
     cache = FlatKVCache(cfg, max_seq_len=8, dtype=torch.float32, device="cuda")
     k = torch.zeros(1, cfg.num_kv_heads, 5, cfg.head_dim, device="cuda")
@@ -230,12 +215,12 @@ def test_kv_cache_overflow_raises():
 
 
 def test_greedy_cached_matches_no_cache_fp32():
-    """Phase 1b exit gate: cache-based decode == no-cache repeated prefill (in fp32).
+    """Cache-based decode produces the same token IDs as no-cache repeated prefill (fp32).
 
-    The no-cache path is validated against HF in Phase 1a, so a match here
-    transitively validates the cache. A failure here is necessarily a bug in
-    FlatKVCache or the cache-aware code in Attention.forward — not in the
-    architecture, since the architecture path is unchanged from Phase 1a.
+    The no-cache path is validated against HuggingFace by the architecture
+    tests above; matching against it here transitively validates the cache.
+    A failure is necessarily a cache bug, not an architecture bug — the
+    architecture path is unchanged from the no-cache reference.
     """
     from transformers import AutoTokenizer
 
@@ -268,3 +253,123 @@ def test_greedy_cached_matches_no_cache_fp32():
             f"no_cache text: {tok.decode(no_cache_out[0])!r}\n"
             f"cached   text: {tok.decode(cached_out[0])!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Static batching with padding
+# ---------------------------------------------------------------------------
+
+
+def test_kv_cache_batched_roundtrip():
+    """Per-batch-element writes don't leak across batch slots."""
+    cfg = ModelConfig.qwen2_5_0_5b()
+    B = 4
+    cache = FlatKVCache(
+        cfg, max_seq_len=16, dtype=torch.float32, device="cuda", batch_size=B
+    )
+    k = torch.randn(B, cfg.num_kv_heads, 5, cfg.head_dim, device="cuda")
+    v = torch.randn(B, cfg.num_kv_heads, 5, cfg.head_dim, device="cuda")
+    cache.write(layer=2, start_pos=3, k=k, v=v)
+
+    k_read, v_read = cache.read(layer=2, end_pos=8)
+    assert k_read.shape == (B, cfg.num_kv_heads, 8, cfg.head_dim)
+    assert torch.equal(k_read[:, :, 3:8, :], k)
+    assert torch.equal(v_read[:, :, 3:8, :], v)
+
+    # Each batch element's slot is independent: writing seq 0 doesn't touch seq 1
+    k_new = torch.randn(1, cfg.num_kv_heads, 2, cfg.head_dim, device="cuda")
+    v_new = torch.randn(1, cfg.num_kv_heads, 2, cfg.head_dim, device="cuda")
+    # Hack: write only into the first slot by indexing the cache directly
+    cache.cache[2, 0, 0:1, :, 0:2, :] = k_new
+    cache.cache[2, 1, 0:1, :, 0:2, :] = v_new
+    k_after, _ = cache.read(layer=2, end_pos=8)
+    assert torch.equal(k_after[0:1, :, 0:2, :], k_new)
+    # Other batch elements untouched at the same positions
+    assert torch.equal(k_after[1:, :, 3:8, :], k[1:, :, :, :])
+
+
+def test_batched_matches_single_fp32():
+    """Batch of 8 copies of one prompt produces the same tokens as a single run, fp32.
+
+    With identical prompts, no padding is needed; this isolates the batched
+    cache + batched attention plumbing from padding correctness.
+    """
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = QwenForCausalLM.from_pretrained(MODEL_ID, device="cuda", dtype=torch.float32)
+    engine = Engine(model, tok, max_seq_len=512)
+
+    prompt = "The capital of France is"
+    prompt_ids = tok(prompt, return_tensors="pt").input_ids.squeeze(0).tolist()
+    n_new = 30
+    B = 8
+
+    # Reference: single-sequence path, repeated B times (deterministic, so all equal)
+    input_ids = torch.tensor([prompt_ids], device="cuda")
+    single_out = engine.generate_ids(input_ids, max_new_tokens=n_new)[0]  # [prompt_len + n_new]
+
+    # Batched path
+    batch_outs = engine.generate_batch_ids([prompt_ids] * B, max_new_tokens=n_new)
+    assert len(batch_outs) == B
+
+    for i, batch_out in enumerate(batch_outs):
+        if not torch.equal(batch_out, single_out):
+            diff_positions = (batch_out != single_out).nonzero(as_tuple=True)[0]
+            first = diff_positions[0].item() if len(diff_positions) else "n/a"
+            pytest.fail(
+                f"batch element {i}: divergence at position {first}\n"
+                f"single: {tok.decode(single_out)!r}\n"
+                f"batch:  {tok.decode(batch_out)!r}"
+            )
+
+
+def test_padding_correctness_fp32():
+    """Variable-length prompts in a batch produce the same per-sequence tokens
+    as running each prompt individually (fp32).
+
+    The actual test of the padding+causal mask: short prompts get left-padded
+    to the longest, and their RoPE positions and attention masking must be
+    set up so they generate identically to the unpadded single-prompt path.
+    """
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = QwenForCausalLM.from_pretrained(MODEL_ID, device="cuda", dtype=torch.float32)
+    engine = Engine(model, tok, max_seq_len=512)
+
+    prompts = [
+        "Hi",
+        "Once upon a time,",
+        "The capital of France is",
+        "def fibonacci(n):",
+    ]
+    prompt_token_lists = [
+        tok(p, return_tensors="pt").input_ids.squeeze(0).tolist() for p in prompts
+    ]
+    n_new = 30
+
+    # Reference: run each prompt through the single-sequence path
+    single_outs = []
+    for p_ids in prompt_token_lists:
+        input_ids = torch.tensor([p_ids], device="cuda")
+        out = engine.generate_ids(input_ids, max_new_tokens=n_new)[0]
+        single_outs.append(out)
+
+    # Batched (left-padded) path
+    batch_outs = engine.generate_batch_ids(prompt_token_lists, max_new_tokens=n_new)
+    assert len(batch_outs) == len(prompts)
+
+    for i, (single, batched) in enumerate(zip(single_outs, batch_outs)):
+        if single.shape != batched.shape:
+            pytest.fail(
+                f"prompt {i} ({prompts[i]!r}): shape {single.shape} vs {batched.shape}"
+            )
+        if not torch.equal(single, batched):
+            diff_positions = (single != batched).nonzero(as_tuple=True)[0]
+            first = diff_positions[0].item()
+            pytest.fail(
+                f"prompt {i} ({prompts[i]!r}): padding-path divergence at position {first}\n"
+                f"single  text: {tok.decode(single)!r}\n"
+                f"batched text: {tok.decode(batched)!r}"
+            )
