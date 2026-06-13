@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from microserve.config import ModelConfig
-from microserve.engine import Engine
+from microserve.engine import Engine, LLMEngine
 from microserve.kv_cache import FlatKVCache
 from microserve.model import QwenForCausalLM, load_weights
 
@@ -373,3 +373,54 @@ def test_padding_correctness_fp32():
                 f"single  text: {tok.decode(single)!r}\n"
                 f"batched text: {tok.decode(batched)!r}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Continuous batching (scheduler-driven)
+# ---------------------------------------------------------------------------
+
+
+def test_continuous_batching_matches_single_fp32():
+    """N prompts run through LLMEngine produce the same per-prompt token IDs
+    as running each prompt individually through the single-sequence Engine.
+
+    Tests the full continuous-batching stack: scheduler admit/retire, per-slot
+    KV cache scatter/gather, variable-context-length attention mask, RoPE
+    positions tied to each sequence's real progress rather than batch index.
+
+    max_batch_size=3 with 5 prompts forces at least one sequence to wait,
+    exercising the admission-on-completion path.
+    """
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = QwenForCausalLM.from_pretrained(MODEL_ID, device="cuda", dtype=torch.float32)
+
+    n_new = 20
+
+    # Reference: single-sequence outputs (one at a time, fresh cache each time)
+    ref_engine = Engine(model, tok, max_seq_len=512)
+    single_outs: list[list[int]] = []
+    for p in PROMPTS:
+        input_ids = tok(p, return_tensors="pt").input_ids.to("cuda")
+        out = ref_engine.generate_ids(input_ids, max_new_tokens=n_new)[0]
+        single_outs.append(out.tolist())
+
+    # Continuous batching: max_batch_size < len(PROMPTS) forces queueing
+    llm = LLMEngine(model, tok, max_batch_size=3, max_seq_len=512)
+    seqs = [llm.add_request(p, max_new_tokens=n_new) for p in PROMPTS]
+    llm.run_until_done()
+
+    for i, (p, seq) in enumerate(zip(PROMPTS, seqs)):
+        cb_full = seq.prompt_token_ids + seq.output_token_ids
+        single = single_outs[i]
+        if cb_full == single:
+            continue
+
+        n = min(len(cb_full), len(single))
+        first = next((j for j in range(n) if cb_full[j] != single[j]), n)
+        pytest.fail(
+            f"prompt {i} ({p!r}): cb vs single divergence at token index {first}\n"
+            f"single        ({len(single)} tokens): {tok.decode(single)!r}\n"
+            f"cont-batched  ({len(cb_full)} tokens): {tok.decode(cb_full)!r}"
+        )

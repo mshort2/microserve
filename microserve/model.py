@@ -129,6 +129,8 @@ class Attention(nn.Module):
         cache: "FlatKVCache | None" = None,
         cache_start: int = 0,
         attn_mask: torch.Tensor | None = None,
+        slot_idxs: torch.Tensor | None = None,
+        cache_starts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, T, _ = x.shape
         cfg = self.cfg
@@ -147,6 +149,26 @@ class Attention(nn.Module):
             k_full = _repeat_kv(k, n_rep)
             v_full = _repeat_kv(v, n_rep)
             out = F.scaled_dot_product_attention(q, k_full, v_full, is_causal=True)
+        elif slot_idxs is not None:
+            # Continuous-batching path: each batch element addresses its own
+            # cache slot at its own write position, and sequences in the same
+            # batch can be at very different cache fill levels. caller-supplied
+            # attn_mask handles the variable extents.
+            assert cache_starts is not None
+            cache.write_at(self.layer_idx, slot_idxs, cache_starts, k, v)
+            end_positions = cache_starts + T
+            max_ctx = int(end_positions.max().item())
+            k_full, v_full = cache.gather_at(self.layer_idx, slot_idxs, max_ctx)
+            k_full = _repeat_kv(k_full, n_rep)
+            v_full = _repeat_kv(v_full, n_rep)
+            if T == 1:
+                # Decode: variable end-positions per sequence, explicit mask.
+                out = F.scaled_dot_product_attention(
+                    q, k_full, v_full, attn_mask=attn_mask, is_causal=False
+                )
+            else:
+                # Prefill of one sequence into its slot: causal within prompt.
+                out = F.scaled_dot_product_attention(q, k_full, v_full, is_causal=True)
         else:
             # Store post-RoPE K/V so subsequent decode steps don't re-rotate.
             cache.write(self.layer_idx, cache_start, k, v)
@@ -199,6 +221,8 @@ class QwenDecoderLayer(nn.Module):
         cache: "FlatKVCache | None" = None,
         cache_start: int = 0,
         attn_mask: torch.Tensor | None = None,
+        slot_idxs: torch.Tensor | None = None,
+        cache_starts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.input_norm(x),
@@ -207,6 +231,8 @@ class QwenDecoderLayer(nn.Module):
             cache=cache,
             cache_start=cache_start,
             attn_mask=attn_mask,
+            slot_idxs=slot_idxs,
+            cache_starts=cache_starts,
         )
         x = x + self.mlp(self.post_attn_norm(x))
         return x
@@ -232,6 +258,8 @@ class QwenForCausalLM(nn.Module):
         cache: "FlatKVCache | None" = None,
         cache_start: int = 0,
         attn_mask: torch.Tensor | None = None,
+        slot_idxs: torch.Tensor | None = None,
+        cache_starts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, T = input_ids.shape
         if positions is None:
@@ -252,6 +280,8 @@ class QwenForCausalLM(nn.Module):
                 cache=cache,
                 cache_start=cache_start,
                 attn_mask=attn_mask,
+                slot_idxs=slot_idxs,
+                cache_starts=cache_starts,
             )
         x = self.norm(x)
         return x @ self.embed.weight.T

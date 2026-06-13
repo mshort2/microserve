@@ -6,6 +6,8 @@ import torch
 
 from microserve.kv_cache import FlatKVCache
 from microserve.model import QwenForCausalLM
+from microserve.scheduler import Scheduler
+from microserve.sequence import Sequence
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -242,3 +244,162 @@ class Engine:
             assert isinstance(text, str)
             completions.append(text)
         return completions
+
+
+class LLMEngine:
+    """Continuous-batching inference engine with persistent state.
+
+    Owns a `Scheduler`, a pre-allocated KV cache for `max_batch_size`
+    sequences, and the model. Each `step()` runs ONE forward pass — either a
+    prefill of one waiting sequence (admitted into a free slot) or a decode
+    step for all currently running sequences. Prefill is prioritized whenever
+    capacity allows.
+
+    Unlike `Engine`, this class is stateful: requests can be added at any time,
+    they enter the running set as space frees up, and finished sequences free
+    their slot for the next request.
+    """
+
+    def __init__(
+        self,
+        model: QwenForCausalLM,
+        tokenizer: "PreTrainedTokenizerBase",
+        max_batch_size: int = 32,
+        max_seq_len: int = 2048,
+    ):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.max_batch_size = max_batch_size
+        self.max_seq_len = max_seq_len
+        param = next(model.parameters())
+        self.device = param.device
+        self.dtype = param.dtype
+
+        self.scheduler = Scheduler(max_batch_size=max_batch_size)
+        self.cache = FlatKVCache(
+            model.cfg,
+            max_seq_len=max_seq_len,
+            dtype=self.dtype,
+            device=self.device,
+            batch_size=max_batch_size,
+        )
+
+    def add_request(self, prompt: str, max_new_tokens: int = 50) -> Sequence:
+        token_ids = (
+            self.tokenizer(prompt, return_tensors="pt").input_ids.squeeze(0).tolist()
+        )
+        seq = Sequence(prompt_token_ids=token_ids, max_new_tokens=max_new_tokens)
+        self.scheduler.add(seq)
+        return seq
+
+    def has_work(self) -> bool:
+        return self.scheduler.has_work()
+
+    @torch.no_grad()
+    def step(self) -> list[Sequence]:
+        """One scheduler+forward step. Returns sequences that finished this step."""
+        sched = self.scheduler
+
+        # Prefer prefill: admit one waiting sequence and run its prefill.
+        if sched.waiting and len(sched.running) < self.max_batch_size:
+            seq = sched.admit_one()
+            assert seq is not None
+            self._do_prefill(seq)
+            if self._is_finished(seq):
+                sched.retire(seq)
+                return [seq]
+            return []
+
+        # Otherwise decode all running sequences in one batched forward pass.
+        if sched.running:
+            self._do_decode(sched.running)
+            finished = []
+            for seq in list(sched.running):
+                if self._is_finished(seq):
+                    sched.retire(seq)
+                    finished.append(seq)
+            return finished
+
+        return []
+
+    def run_until_done(self, max_steps: int = 100_000) -> dict[int, Sequence]:
+        """Run until no work remains. Returns {seq_id: finished Sequence}."""
+        finished: dict[int, Sequence] = {}
+        for _ in range(max_steps):
+            if not self.has_work():
+                break
+            for seq in self.step():
+                finished[seq.seq_id] = seq
+        return finished
+
+    def _is_finished(self, seq: Sequence) -> bool:
+        if not seq.output_token_ids:
+            return False
+        if seq.output_token_ids[-1] == self.tokenizer.eos_token_id:
+            return True
+        if seq.output_len >= seq.max_new_tokens:
+            return True
+        return False
+
+    def _do_prefill(self, seq: Sequence) -> None:
+        input_ids = torch.tensor(
+            [seq.prompt_token_ids], device=self.device, dtype=torch.long
+        )
+        T = input_ids.shape[1]
+        positions = torch.arange(T, device=self.device).unsqueeze(0)  # [1, T]
+        slot_idxs = torch.tensor([seq.slot_idx], device=self.device, dtype=torch.long)
+        cache_starts = torch.tensor([0], device=self.device, dtype=torch.long)
+
+        logits = self.model(
+            input_ids,
+            positions=positions,
+            cache=self.cache,
+            slot_idxs=slot_idxs,
+            cache_starts=cache_starts,
+        )
+        next_token = int(logits[0, -1, :].argmax(dim=-1).item())
+        seq.append_token(next_token)
+
+    def _do_decode(self, sequences: list[Sequence]) -> None:
+        B = len(sequences)
+        # Each sequence's "last output token" is the input to this decode step.
+        input_ids = torch.tensor(
+            [[s.output_token_ids[-1]] for s in sequences],
+            device=self.device,
+            dtype=torch.long,
+        )
+
+        # Per-sequence RoPE position: the position where the NEW token lives.
+        # That's seq.context_len (= cache entries already in place).
+        context_lens = torch.tensor(
+            [s.context_len for s in sequences],
+            device=self.device,
+            dtype=torch.long,
+        )
+        positions = context_lens.unsqueeze(-1)  # [B, 1]
+        slot_idxs = torch.tensor(
+            [s.slot_idx for s in sequences], device=self.device, dtype=torch.long
+        )
+        cache_starts = context_lens
+
+        # Attention mask over the variable-extent K/V history: valid where
+        # key_pos < context_lens[b] + 1 (i.e., includes the K/V just written).
+        end_positions = context_lens + 1
+        max_ctx = int(end_positions.max().item())
+        key_positions = torch.arange(max_ctx, device=self.device)
+        valid = key_positions[None, :] < end_positions[:, None]  # [B, max_ctx]
+        additive = torch.zeros((B, max_ctx), dtype=self.dtype, device=self.device)
+        additive.masked_fill_(~valid, torch.finfo(self.dtype).min)
+        attn_mask = additive.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, max_ctx]
+
+        logits = self.model(
+            input_ids,
+            positions=positions,
+            cache=self.cache,
+            slot_idxs=slot_idxs,
+            cache_starts=cache_starts,
+            attn_mask=attn_mask,
+        )
+        next_tokens = logits[:, -1, :].argmax(dim=-1).tolist()
+        for s, t in zip(sequences, next_tokens):
+            s.append_token(int(t))
