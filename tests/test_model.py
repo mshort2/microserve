@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from microserve.config import ModelConfig
-from microserve.engine import Engine, LLMEngine
+from microserve.engine import Engine, LLMEngine, PagedLLMEngine
 from microserve.kv_cache import FlatKVCache
 from microserve.model import QwenForCausalLM, load_weights
 
@@ -380,6 +380,22 @@ def test_padding_correctness_fp32():
 # ---------------------------------------------------------------------------
 
 
+STRESS_PROMPTS = [
+    "The capital of France is",
+    "def fibonacci(n):",
+    "Once upon a time,",
+    "The mitochondrion is the",
+    "import numpy as np\n\ndef softmax(x):",
+    "Hello, my name is",
+    "The quick brown fox",
+    "In a galaxy far far away,",
+    "def quicksort(arr):",
+    "The history of computing began",
+    "Hi there, I want to learn about",
+    "Write a function that returns",
+]
+
+
 def test_continuous_batching_matches_single_fp32():
     """N prompts run through LLMEngine produce the same per-prompt token IDs
     as running each prompt individually through the single-sequence Engine.
@@ -424,3 +440,376 @@ def test_continuous_batching_matches_single_fp32():
             f"single        ({len(single)} tokens): {tok.decode(single)!r}\n"
             f"cont-batched  ({len(cb_full)} tokens): {tok.decode(cb_full)!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Continuous batching: stress tests (heavy admission/retirement churn)
+# ---------------------------------------------------------------------------
+
+
+def _run_single_seq_references(
+    tok, model, prompts: list[str], max_new_tokens: int
+) -> list[list[int]]:
+    """Run each prompt through the single-sequence Engine to get the ground truth.
+
+    Shared between stress tests so we don't re-run reference generation 3x in
+    the same pytest session (still expensive but at least factored).
+    """
+    ref_engine = Engine(model, tok, max_seq_len=512)
+    refs: list[list[int]] = []
+    for p in prompts:
+        input_ids = tok(p, return_tensors="pt").input_ids.to("cuda")
+        out = ref_engine.generate_ids(input_ids, max_new_tokens=max_new_tokens)[0]
+        refs.append(out.tolist())
+    return refs
+
+
+def test_continuous_batching_high_churn_fp32():
+    """12 prompts through max_batch_size=2 forces 10 sequences to wait.
+
+    Each admission requires the freed-slot reuse path, and each running
+    sequence shares a forward pass with whichever other sequence is in the
+    other slot — different decode partner on every step as completions stagger.
+
+    Verifies per-prompt outputs still match the single-sequence reference
+    despite this churn, proving the scheduler's slot reuse and the cache's
+    per-slot scatter/gather don't bleed state across sequence reassignments.
+    """
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = QwenForCausalLM.from_pretrained(MODEL_ID, device="cuda", dtype=torch.float32)
+
+    n_new = 12
+    single_outs = _run_single_seq_references(tok, model, STRESS_PROMPTS, n_new)
+
+    # max_batch_size=2 with 12 prompts → at any time only 2 run, 10+ wait.
+    # Expect ~10 retirement→admission cycles over the full run.
+    llm = LLMEngine(model, tok, max_batch_size=2, max_seq_len=512)
+    seqs = [llm.add_request(p, max_new_tokens=n_new) for p in STRESS_PROMPTS]
+    llm.run_until_done()
+
+    for i, (p, seq) in enumerate(zip(STRESS_PROMPTS, seqs)):
+        cb_full = seq.prompt_token_ids + seq.output_token_ids
+        single = single_outs[i]
+        if cb_full == single:
+            continue
+        n = min(len(cb_full), len(single))
+        first = next((j for j in range(n) if cb_full[j] != single[j]), n)
+        pytest.fail(
+            f"prompt {i} ({p!r}): high-churn divergence at token {first}\n"
+            f"single ({len(single)}): {tok.decode(single)!r}\n"
+            f"cb     ({len(cb_full)}): {tok.decode(cb_full)!r}"
+        )
+
+
+def test_continuous_batching_varied_max_tokens_fp32():
+    """Same prompt, 8 sequences, each with a different max_new_tokens.
+
+    The sequences all generate identical tokens (greedy on identical inputs)
+    but stop at different decode steps: seq[0] retires after 6 tokens,
+    seq[1] after 10, ..., seq[7] after 34. This exercises asymmetric
+    retirement (sequences finishing at different points while others continue)
+    and verifies that early retirees don't corrupt later sequences sharing
+    the same batch on subsequent steps.
+    """
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = QwenForCausalLM.from_pretrained(MODEL_ID, device="cuda", dtype=torch.float32)
+
+    prompt = "The capital of France is"
+    max_tokens_list = [6, 10, 14, 18, 22, 26, 30, 34]
+
+    # Reference: run the prompt once at the maximum budget; each shorter
+    # variant is just a prefix of this run (greedy + same prompt is deterministic).
+    ref_engine = Engine(model, tok, max_seq_len=512)
+    prompt_ids = tok(prompt, return_tensors="pt").input_ids.to("cuda")
+    full_ref = ref_engine.generate_ids(
+        prompt_ids, max_new_tokens=max(max_tokens_list)
+    )[0].tolist()
+
+    # CB: 8 copies of the prompt with varying max_new_tokens.
+    # max_batch_size=3 keeps 5 in waiting initially.
+    llm = LLMEngine(model, tok, max_batch_size=3, max_seq_len=512)
+    seqs = [llm.add_request(prompt, max_new_tokens=n) for n in max_tokens_list]
+    llm.run_until_done()
+
+    for n_target, seq in zip(max_tokens_list, seqs):
+        cb_full = seq.prompt_token_ids + seq.output_token_ids
+        # Expected length: prompt + up to n_target generated tokens (or fewer if EOS hit).
+        # Compare against the corresponding prefix of the longest single run.
+        ref_prefix = full_ref[: len(cb_full)]
+        if cb_full == ref_prefix:
+            assert seq.output_len <= n_target, (
+                f"max_new_tokens={n_target} overran: produced {seq.output_len} tokens"
+            )
+            continue
+        n = min(len(cb_full), len(ref_prefix))
+        first = next((j for j in range(n) if cb_full[j] != ref_prefix[j]), n)
+        pytest.fail(
+            f"max_new_tokens={n_target}: divergence at token {first}\n"
+            f"ref prefix ({len(ref_prefix)}): {tok.decode(ref_prefix)!r}\n"
+            f"cb         ({len(cb_full)}): {tok.decode(cb_full)!r}"
+        )
+
+
+def test_continuous_batching_mid_run_admission_fp32():
+    """Add 3 prompts, run several steps, then add 3 more while the first
+    batch is still decoding.
+
+    Verifies that mid-flight admission (new requests joining a running engine)
+    doesn't disrupt in-progress sequences and that the late arrivals still
+    produce correct outputs after starting from a non-empty engine state.
+    """
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = QwenForCausalLM.from_pretrained(MODEL_ID, device="cuda", dtype=torch.float32)
+
+    first_wave = STRESS_PROMPTS[:3]
+    second_wave = STRESS_PROMPTS[3:6]
+    all_prompts = first_wave + second_wave
+    n_new = 15
+
+    single_outs = _run_single_seq_references(tok, model, all_prompts, n_new)
+
+    llm = LLMEngine(model, tok, max_batch_size=4, max_seq_len=512)
+
+    # First wave: add 3, run several steps so they get past prefill and into decode
+    seqs = [llm.add_request(p, max_new_tokens=n_new) for p in first_wave]
+    for _ in range(8):
+        if not llm.has_work():
+            break
+        llm.step()
+
+    # Mid-flight: add 3 more while the first wave is still decoding
+    seqs += [llm.add_request(p, max_new_tokens=n_new) for p in second_wave]
+
+    # Now drive to completion
+    llm.run_until_done()
+
+    for i, (p, seq) in enumerate(zip(all_prompts, seqs)):
+        cb_full = seq.prompt_token_ids + seq.output_token_ids
+        single = single_outs[i]
+        wave = "1st" if i < len(first_wave) else "2nd"
+        if cb_full == single:
+            continue
+        n = min(len(cb_full), len(single))
+        first = next((j for j in range(n) if cb_full[j] != single[j]), n)
+        pytest.fail(
+            f"prompt {i} ({p!r}, {wave} wave): mid-run divergence at token {first}\n"
+            f"single ({len(single)}): {tok.decode(single)!r}\n"
+            f"cb     ({len(cb_full)}): {tok.decode(cb_full)!r}"
+        )
+
+
+def test_engine_handles_seq_length_overflow():
+    """A sequence whose total length exceeds max_seq_len triggers a clean
+    RuntimeError from the KV cache. The engine doesn't silently corrupt:
+      - sequences that fit complete before the crash and are retired correctly
+      - the error message clearly identifies the overflow
+      - scheduler bookkeeping (running set, free slots) is intact after the
+        exception, so the crash is recoverable in principle
+
+    This is the only "out of cache memory" failure mode the current preallocated
+    design exposes. There's no graceful preemption — overflow on one sequence
+    aborts the step (and currently the engine), which is the right semantics
+    for a fail-loud educational implementation.
+    """
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = QwenForCausalLM.from_pretrained(MODEL_ID, device="cuda", dtype=torch.float32)
+
+    # Tight cache: 30 positions per slot. A 5-token completion fits comfortably
+    # (prompt is ~5 tokens + 5 output = ~10 ≤ 30); 100 output tokens overflows
+    # well before completion.
+    SHORT_TOKENS = 5
+    LONG_TOKENS = 100
+    llm = LLMEngine(model, tok, max_batch_size=2, max_seq_len=30)
+
+    good = llm.add_request("The capital of France is", max_new_tokens=SHORT_TOKENS)
+    bad = llm.add_request("The capital of France is", max_new_tokens=LONG_TOKENS)
+
+    with pytest.raises(RuntimeError, match="overflow"):
+        llm.run_until_done()
+
+    # The short sequence completed and was retired before the crash.
+    assert good.is_finished, "good seq should have been retired before the crash"
+    assert good.output_len == SHORT_TOKENS, (
+        f"good seq should have produced {SHORT_TOKENS} tokens, got {good.output_len}"
+    )
+
+    # The long sequence got past the short budget before crashing.
+    assert bad.output_len > SHORT_TOKENS, (
+        f"bad seq should have produced > {SHORT_TOKENS} tokens before the crash, "
+        f"got {bad.output_len}"
+    )
+
+    # Scheduler bookkeeping is intact: bad is still tracked, good's slot is free.
+    assert bad in llm.scheduler.running, "bad seq should still be tracked as running"
+    assert good not in llm.scheduler.running, "good seq should have been retired"
+    assert len(llm.scheduler.free_slots) == 1, (
+        f"good's slot should be back in the free pool; "
+        f"free_slots={llm.scheduler.free_slots}"
+    )
+
+
+def test_continuous_batching_heavy_load_stress_fp32():
+    """Sustained-load stress test: 64 identical requests through max_batch_size=4.
+
+    Drives the engine through 16 batch waves (~60 admission/retirement cycles).
+    Each wave does 4 single-seq prefills then ~39 batched decode steps to
+    completion, for ~688 total forward passes. Runs ~25-35 s on A10 in fp32.
+
+    Because every prompt is identical and decoding is deterministic-greedy in
+    fp32, all 64 sequences MUST produce the exact same output as the
+    single-sequence reference. Any divergence indicates cross-sequence
+    corruption — wrong slot scatter, mask off-by-one, RoPE position mixup,
+    or stale data leaking from a previous occupant of a reused slot.
+
+    A test failing here when the smaller stress tests pass would point at
+    cumulative-state bugs that only appear under sustained churn — exactly
+    the kind of bug that slips through 5- or 12-sequence tests.
+    """
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = QwenForCausalLM.from_pretrained(MODEL_ID, device="cuda", dtype=torch.float32)
+
+    N_REQUESTS = 64
+    N_NEW_TOKENS = 40
+    MAX_BATCH_SIZE = 4
+
+    prompt = "The capital of France is"
+
+    # Single-sequence reference — run once; all repeated requests must match it.
+    ref_engine = Engine(model, tok, max_seq_len=512)
+    input_ids = tok(prompt, return_tensors="pt").input_ids.to("cuda")
+    reference = ref_engine.generate_ids(
+        input_ids, max_new_tokens=N_NEW_TOKENS
+    )[0].tolist()
+
+    # Continuous-batching run.
+    llm = LLMEngine(
+        model, tok, max_batch_size=MAX_BATCH_SIZE, max_seq_len=512
+    )
+    seqs = [
+        llm.add_request(prompt, max_new_tokens=N_NEW_TOKENS)
+        for _ in range(N_REQUESTS)
+    ]
+    llm.run_until_done()
+
+    # Every one of N_REQUESTS sequences should match the reference exactly.
+    failures: list[tuple[int, int]] = []  # (seq_index, first_diverging_token_idx)
+    for i, seq in enumerate(seqs):
+        cb_full = seq.prompt_token_ids + seq.output_token_ids
+        if cb_full == reference:
+            continue
+        n = min(len(cb_full), len(reference))
+        first = next((j for j in range(n) if cb_full[j] != reference[j]), n)
+        failures.append((i, first))
+
+    if failures:
+        first_idx, first_tok = failures[0]
+        seq = seqs[first_idx]
+        cb_full = seq.prompt_token_ids + seq.output_token_ids
+        failed_seq_indices = [i for i, _ in failures]
+        head = failed_seq_indices[:10]
+        more = f" (and {len(failed_seq_indices) - 10} more)" if len(failed_seq_indices) > 10 else ""
+        pytest.fail(
+            f"{len(failures)}/{N_REQUESTS} sequences diverged from the single-seq reference.\n"
+            f"first divergence: seq index {first_idx} at token index {first_tok}\n"
+            f"failed seq indices: {head}{more}\n"
+            f"reference: {tok.decode(reference)!r}\n"
+            f"diverged:  {tok.decode(cb_full)!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Paged attention (PyTorch reference implementation)
+# ---------------------------------------------------------------------------
+
+
+def test_paged_attention_matches_single_seq_fp32():
+    """N prompts through PagedLLMEngine produce token-identical outputs to
+    running each prompt individually through the single-sequence Engine.
+
+    The paged path lays out K/V in 16-token blocks tracked by per-sequence
+    block tables instead of fixed slots. Mathematically the gathered K/V
+    must equal the contiguous flat-cache layout — same values, different
+    physical addresses. Failure here is a bug in the BlockManager scatter/
+    gather, in the per-prefill / per-decode block bookkeeping, or in the
+    paged attention mask construction.
+
+    Uses an intentionally tight block pool (just enough to hold ~4 sequences
+    at once given typical prompt lengths) so admission has to defer waiting
+    sequences until earlier ones finish and return their blocks.
+    """
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = QwenForCausalLM.from_pretrained(MODEL_ID, device="cuda", dtype=torch.float32)
+
+    n_new = 20
+
+    # Single-sequence reference: one prompt at a time, fresh flat cache.
+    ref_engine = Engine(model, tok, max_seq_len=512)
+    single_outs: list[list[int]] = []
+    for p in PROMPTS:
+        input_ids = tok(p, return_tensors="pt").input_ids.to("cuda")
+        out = ref_engine.generate_ids(input_ids, max_new_tokens=n_new)[0]
+        single_outs.append(out.tolist())
+
+    # Paged engine. Small block pool: 32 blocks * 16 = 512 token-slots total,
+    # enough to hold the test prompts but tight enough that not all 5 fit
+    # simultaneously. max_batch_size=3 mirrors the LLMEngine integration test.
+    paged = PagedLLMEngine(
+        model, tok, num_blocks=32, block_size=16, max_batch_size=3
+    )
+    seqs = [paged.add_request(p, max_new_tokens=n_new) for p in PROMPTS]
+    paged.run_until_done()
+
+    for i, (p, seq) in enumerate(zip(PROMPTS, seqs)):
+        paged_full = seq.prompt_token_ids + seq.output_token_ids
+        single = single_outs[i]
+        if paged_full == single:
+            continue
+        n = min(len(paged_full), len(single))
+        first = next((j for j in range(n) if paged_full[j] != single[j]), n)
+        pytest.fail(
+            f"prompt {i} ({p!r}): paged vs single divergence at token index {first}\n"
+            f"single ({len(single)}): {tok.decode(single)!r}\n"
+            f"paged  ({len(paged_full)}): {tok.decode(paged_full)!r}"
+        )
+
+
+def test_paged_engine_releases_blocks_on_completion():
+    """After all sequences finish, every block should be back in the free pool.
+
+    Catches block-table-leak bugs: if `_retire` forgets to free a sequence's
+    blocks, the pool slowly drains across many requests until admission
+    deadlocks. We don't test this directly under load, but a single completion
+    cycle is sufficient to catch the basic leak.
+    """
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = QwenForCausalLM.from_pretrained(MODEL_ID, device="cuda", dtype=torch.float32)
+
+    NUM_BLOCKS = 16
+    paged = PagedLLMEngine(
+        model, tok, num_blocks=NUM_BLOCKS, block_size=16, max_batch_size=2
+    )
+
+    # Add and run a few requests to completion
+    for _ in range(3):
+        paged.add_request("The capital of France is", max_new_tokens=10)
+    paged.run_until_done()
+
+    # Pool should be fully refilled
+    assert paged.block_manager.num_free == NUM_BLOCKS, (
+        f"block leak: only {paged.block_manager.num_free} of {NUM_BLOCKS} free "
+        f"after all sequences finished"
+    )

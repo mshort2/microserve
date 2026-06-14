@@ -57,7 +57,7 @@ print(f"torch={torch.__version__}  cuda={torch.version.cuda}  gpu={torch.cuda.ge
 PY
 echo
 
-# ---- 6. Run the Phase 1a test gate ----
+# ---- 6. Run the test gate ----
 echo "=== Running tests ==="
 pytest tests/ -v
 

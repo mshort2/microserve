@@ -10,6 +10,7 @@ from torch.nn import functional as F
 from microserve.config import ModelConfig
 
 if TYPE_CHECKING:
+    from microserve.block_manager import BlockManager
     from microserve.kv_cache import FlatKVCache
 
 
@@ -131,6 +132,10 @@ class Attention(nn.Module):
         attn_mask: torch.Tensor | None = None,
         slot_idxs: torch.Tensor | None = None,
         cache_starts: torch.Tensor | None = None,
+        block_manager: "BlockManager | None" = None,
+        block_tables: torch.Tensor | None = None,
+        write_block_ids: torch.Tensor | None = None,
+        write_slot_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, T, _ = x.shape
         cfg = self.cfg
@@ -143,7 +148,25 @@ class Attention(nn.Module):
 
         n_rep = cfg.num_q_heads // cfg.num_kv_heads
 
-        if cache is None:
+        if block_manager is not None:
+            # Paged path: write post-RoPE K/V into per-token (block, slot)
+            # destinations, then gather K/V for each sequence by its
+            # block_table. The gather materializes a contiguous tensor in
+            # HBM — slow under PyTorch, but the CUDA kernel in a later phase
+            # avoids the materialization by reading the block table inline.
+            assert block_tables is not None
+            assert write_block_ids is not None
+            assert write_slot_ids is not None
+            block_manager.write_kv(
+                self.layer_idx, write_block_ids, write_slot_ids, k, v
+            )
+            k_full, v_full = block_manager.gather_kv(self.layer_idx, block_tables)
+            k_full = _repeat_kv(k_full, n_rep)
+            v_full = _repeat_kv(v_full, n_rep)
+            out = F.scaled_dot_product_attention(
+                q, k_full, v_full, attn_mask=attn_mask, is_causal=False
+            )
+        elif cache is None:
             # No-cache forward: runs the full transformer on the entire input
             # each call (used as the architecture-correctness reference path).
             k_full = _repeat_kv(k, n_rep)
@@ -223,6 +246,10 @@ class QwenDecoderLayer(nn.Module):
         attn_mask: torch.Tensor | None = None,
         slot_idxs: torch.Tensor | None = None,
         cache_starts: torch.Tensor | None = None,
+        block_manager: "BlockManager | None" = None,
+        block_tables: torch.Tensor | None = None,
+        write_block_ids: torch.Tensor | None = None,
+        write_slot_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.input_norm(x),
@@ -233,6 +260,10 @@ class QwenDecoderLayer(nn.Module):
             attn_mask=attn_mask,
             slot_idxs=slot_idxs,
             cache_starts=cache_starts,
+            block_manager=block_manager,
+            block_tables=block_tables,
+            write_block_ids=write_block_ids,
+            write_slot_ids=write_slot_ids,
         )
         x = x + self.mlp(self.post_attn_norm(x))
         return x
@@ -260,6 +291,10 @@ class QwenForCausalLM(nn.Module):
         attn_mask: torch.Tensor | None = None,
         slot_idxs: torch.Tensor | None = None,
         cache_starts: torch.Tensor | None = None,
+        block_manager: "BlockManager | None" = None,
+        block_tables: torch.Tensor | None = None,
+        write_block_ids: torch.Tensor | None = None,
+        write_slot_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, T = input_ids.shape
         if positions is None:
@@ -282,6 +317,10 @@ class QwenForCausalLM(nn.Module):
                 attn_mask=attn_mask,
                 slot_idxs=slot_idxs,
                 cache_starts=cache_starts,
+                block_manager=block_manager,
+                block_tables=block_tables,
+                write_block_ids=write_block_ids,
+                write_slot_ids=write_slot_ids,
             )
         x = self.norm(x)
         return x @ self.embed.weight.T
